@@ -104,37 +104,122 @@ join Windhaven_Report.dbo.policy on policy.policyId = coveragePremium.policyId
 join Windhaven_Report.dbo.producer on policy.producerId = producer.producerId
 group by concat(code,'-',subcode);
 
--- loss counts
-insert into Periscope_Data.dbo.AGENT_METRICS (AGENT_NUMBER, REPORT_DATE, METRIC, METRIC_NUMBER)
-select concat(code,'-',subcode),
-@report_date,
-concat(cov,' COUNT'),
-count(*)
-from (
-select claimNum, cov, min(dateChanged) as openDate, min(policyId) as policyId
-from (
-select claim.claimNum,
-case a.policyCoveragesId when 20 then 'COL' when 19 then 'CMP' when 11 then 'BI' when 12 then 'PD' when 22 then 'PIP'
-	when 15 then 'UMPD' when 14 then 'UMBI' when 27 then 'RENT' when 24 then 'TOW' when 18 then 'UNPD'when 36 then 'UNBI' when 51 then 'CDW'
-end as cov,
- a.dateOpened as dateChanged, ClaimIncident.policyId
-from Windhaven_Report.dbo.ClaimLog a
-join Windhaven_Report.dbo.claim on a.claimID = claim.claimID
-join Windhaven_Report.dbo.claimincident on claim.claimincidentId = claimincident.claimincidentId
-union all 
-select ClaimNumber as claimNum,
-replace(Coverage,'COM','CMP') as cov, TranDate as dateChanged, null as policyId
-from Periscope_Data.B2_Data.Claims_Trans) b
-where cov <> '*'
-group by claimNum, cov) b
-join Windhaven_Report.dbo.policy on policy.policyId = b.policyId
-join Windhaven_Report.dbo.producer on producer.producerId = policy.producerId
-where convert(date,openDate) between 
-	case when dateadd(day,1,eomonth(dateadd(YEAR,-1,@report_date))) < '2017-01-01' then '2017-01-01'
-		else dateadd(day,1,eomonth(dateadd(YEAR,-1,@report_date))) end
-	and @report_date
-and cov in ('PIP','BI','CMP','COL','PD')
-group by concat(code,'-',subcode), cov
+-- loss counts and loss amounts
+	--Severities
+	SELECT State, Cov, Severity 
+	INTO #Temp_Severities
+	From
+		(SELECT A.STATE, A.MONTH_End, S1.BI, S1.PD, S1.CMP, S1.COL, S1.PIP FROM
+			(SELECT STATE, max(month_end) as month_end
+			FROM Periscope_Data.dbo.SEVERITIES 
+			WHERE MONTH_END <= @Report_date
+			group by STATE
+			) A
+		join Periscope_Data.dbo.Severities AS S1 on A.Month_end=S1.MONTH_END AND A.STATE=S1.STATE) AS B
+	UNPIVOT (Severity FOR Cov in (B.BI, B.PD, B.CMP, B.COL, B.PIP)) as UNPVT;
+
+	--Territory Relativities
+	SELECT State, ADJUSTED_FACTOR as Territory, REPLACE(Cov,'_Adjust','') as Cov, Severity as Terr_Factor
+	INTO #Temp_Terr_Rels
+	FROM (
+		SELECT State, Cov, ADJUSTED_FACTOR, Severity
+		FROM Periscope_Data.dbo.MONTHLY_ADJUSTMENT_FACTORS
+		UNPIVOT(Severity for Cov in (BI_Adjust, PD_Adjust, CMP_Adjust, COL_Adjust,PIP_Adjust)) as UNPVT) B
+	WHERE ADJUSTED_FACTOR not in (SELECT DISTINCT ProgName from Periscope_Data.dbo.ProgramNum);
+
+	--Program Relativities
+	SELECT State, ADJUSTED_FACTOR as Program, REPLACE(Cov,'_Adjust','') as Cov, Severity as Prog_Factor
+	INTO #Temp_Prog_Rels
+	FROM (
+		SELECT State, Cov, ADJUSTED_FACTOR, Severity
+		FROM Periscope_data.dbo.MONTHLY_ADJUSTMENT_FACTORS
+		UNPIVOT(Severity for Cov in (BI_Adjust, PD_Adjust, CMP_Adjust, COL_Adjust,PIP_Adjust)) as UNPVT) B
+	WHERE ADJUSTED_FACTOR in (SELECT DISTINCT ProgName from Periscope_Data.dbo.ProgramNum);
+
+	--Main Query
+	select B.policyID, B.claimNum, B.Cov, B.datechanged, B.State,
+	CASE WHEN S.Severity is null then 0 else S.Severity END as Sev, 
+	P.ratingprogram, PN.ProgName, 
+	CASE WHEN Prog_Factor is null then 1 else Prog_Factor END as Prog_Factor,
+	CASE WHEN Terr_Factor is null then 1 else Terr_Factor END as Terr_Factor,
+	(CASE WHEN S.Severity is null then 0 else S.Severity END *CASE WHEN Prog_Factor is null then 1 else Prog_Factor END *CASE WHEN Terr_Factor is null then 1 else Terr_Factor END) as LossAmt
+	INTO #Temp_Main_Query
+	FROM (
+		--pulls claims by coverage, matches to garaging address. Some of the data is still on B2, hence the union. 
+		--B2 data doesn't have address info available AFAIK so will just use relativities with no county/program adjustments.
+		--Found out there are entries for which COUNTY is null or blank but ZIPCODE is not, and vice versa. Affects ~17% of non-B2 claims.
+		--Future should look at COUNTY first, if blank then match zip code to "most likely" county.
+		select claim.claimNum,
+		case A.policyCoveragesId when 20 then 'COL' when 19 then 'CMP' when 11 then 'BI' when 12 then 'PD' when 22 then 'PIP'
+			when 15 then 'UMPD' when 14 then 'UMBI' when 27 then 'RENT' when 24 then 'TOW' when 18 then 'UNPD'when 36 then 'UNBI' when 51 then 'CDW'
+		end as cov,
+			A.dateOpened as dateChanged, ClaimIncident.policyId, veh.policyID as VehPolID, veh.county, veh.State 
+		from Windhaven_Report.dbo.ClaimLog A
+		join Windhaven_Report.dbo.claim on A.claimID = claim.claimID
+		join Windhaven_Report.dbo.claimincident on claim.claimincidentId = claimincident.claimincidentId
+		join (select vehicle.policyId, min(vehicleNumber) as minVeh, min(GaragingAddressID) as GaragingAddressID, address.County, address.STATE
+			from [Windhaven_Report].dbo.vehicle
+			join [Windhaven_Report].dbo.address on GaragingAddressID=Address.ID
+			group by policyId, county, state) 
+			veh on veh.policyId = ClaimIncident.policyId
+		union all 
+		select ClaimNumber as claimNum,
+		replace(Coverage,'COM','CMP') as cov, TranDate as dateChanged, null as policyId, null as VehPolID, null as County, 
+		'TX' as STATE --All B2 data is TX. 
+		from Periscope_Data.B2_Data.Claims_Trans) as B
+	left join #Temp_Severities as S on B.state=S.State and B.cov=S.Cov --Severities by state and coverage
+	left join Windhaven_Report.dbo.policy as P on B.PolicyID=P.policyID --Rating Program 
+	left join Periscope_data.dbo.ProgramNum as PN on P.ratingprogram=PN.prognum --turn Rating Program (number) into Rating Name (e.g., OPT)
+	left join #Temp_Prog_Rels as R on PN.progname= R.Program and B.State=R.State and B.Cov=R.Cov --Program relativities
+	left join #Temp_Terr_Rels as T on B.state=T.state and B.county=T.Territory and B.Cov=T.Cov; --Territory Relativities
+
+	--Get Counts
+	INSERT INTO Periscope_Data.dbo.AGENT_METRICS (AGENT_NUMBER, REPORT_DATE, METRIC, METRIC_NUMBER)
+	select concat(code,'-',subcode),
+	@report_date,
+	concat(cov,' COUNT'),
+	count(*)
+	from 
+	(select claimNum, cov, min(dateChanged) as openDate, min(policyId) as policyId
+			from #Temp_Main_Query AS A
+			where cov <> '*'
+			group by claimNum, cov) B
+	join Windhaven_Report.dbo.policy on policy.policyId = b.policyId		
+	join Windhaven_Report.dbo.producer on producer.producerId = policy.producerId		
+	where convert(date,openDate) between 		
+		case when dateadd(day,1,eomonth(dateadd(YEAR,-1,@report_date))) < '2017-01-01' then '2017-01-01'	
+			else dateadd(day,1,eomonth(dateadd(YEAR,-1,@report_date))) end
+		and @report_date
+	and cov in ('PIP','BI','CMP','COL','PD')		
+	group by concat(code,'-',subcode), cov;
+
+
+	--Get Loss Amounts by Agent
+	INSERT INTO Periscope_Data.dbo.AGENT_METRICS (AGENT_NUMBER, REPORT_DATE, METRIC, METRIC_NUMBER)
+	SELECT C.Agent,
+	C.Month_End,
+	'TOTAL LOSS', 
+	sum(C.LossAmt) 
+	FROM (
+		SELECT 
+		concat(code,'-',subcode) as Agent,
+		@report_date as Month_End,
+		sum(LossAmt) as LossAmt
+		from (
+			select claimNum, cov, min(dateChanged) as openDate, min(policyId) as policyId, max(lossamt) as lossamt
+			from #Temp_Main_Query AS A
+			where cov <> '*'
+			group by claimNum, cov
+			) b
+		join Windhaven_Report.dbo.policy on policy.policyId = b.policyId		
+		join Windhaven_Report.dbo.producer on producer.producerId = policy.producerId		
+		where convert(date,openDate) between 		
+			case when dateadd(day,1,eomonth(dateadd(YEAR,-1,@report_date))) < '2017-01-01' then '2017-01-01'	
+				else dateadd(day,1,eomonth(dateadd(YEAR,-1,@report_date))) end
+			and @report_date	
+		and cov in ('PIP','BI','CMP','COL','PD')
+		GROUP BY concat(code,'-',subcode)) C
+	GROUP BY Agent,Month_End;
 
 -- 7 month retention
 insert into Periscope_Data.dbo.AGENT_METRICS (AGENT_NUMBER, REPORT_DATE, METRIC, METRIC_NUMBER)
